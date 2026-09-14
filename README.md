@@ -109,7 +109,7 @@ Scaffold a run for a single design:
 ```bash
 bin/run-design fuel-core-attackathon /path/to/target-repo \
   --run-name my-audit-run \
-  --parallel-jobs 8 \
+  --parallel-jobs 4 \
   --force
 ```
 
@@ -118,7 +118,7 @@ Then execute the generated run with that design's parallel runner:
 ```bash
 designs/fuel-core-attackathon/bin/run-parallel-codex \
   designs/fuel-core-attackathon/runs/my-audit-run \
-  --jobs 8 \
+  --jobs 4 \
   --service-tier standard \
   --reasoning-effort high \
   --deep-reasoning-effort xhigh \
@@ -131,7 +131,7 @@ To execute that run with Claude Code instead:
 designs/fuel-core-attackathon/bin/run-parallel-codex \
   designs/fuel-core-attackathon/runs/my-audit-run \
   --agent claude \
-  --jobs 8 \
+  --jobs 4 \
   --claude-add-dir /path/to/target-repo
 ```
 
@@ -145,7 +145,7 @@ bin/run-blind-suite \
   --suite-name my-blind-suite \
   --design monad-c4 \
   --design fuel-core-attackathon \
-  --parallel-jobs 8
+  --parallel-jobs 4
 ```
 
 The suite copies each selected design into `runs/<suite-name>/design-workspaces/<design>/design/`, excludes design run output, scaffolds an audit run, injects blind-isolation instructions, and executes the design. With the default Codex worker, it uses:
@@ -164,7 +164,7 @@ bin/run-blind-suite \
   --design monad-c4 \
   --design fuel-core-attackathon \
   --agent claude \
-  --parallel-jobs 8
+  --parallel-jobs 4
 ```
 
 The suite automatically passes the target repo and copied design workspace to Claude with `--claude-add-dir`.

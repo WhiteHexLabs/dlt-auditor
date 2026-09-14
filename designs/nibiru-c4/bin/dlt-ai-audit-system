@@ -496,7 +496,7 @@ def main() -> int:
     parser.add_argument(
         "--parallel-jobs",
         type=int,
-        default=int(os.environ.get("DLT_AUDIT_PARALLEL_JOBS", "8")),
+        default=int(os.environ.get("DLT_AUDIT_PARALLEL_JOBS", "4")),
         help="Suggested Codex worker count recorded in generated parallel-run instructions.",
     )
     args = parser.parse_args()

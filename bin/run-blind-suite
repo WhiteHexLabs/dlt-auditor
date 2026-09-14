@@ -586,7 +586,7 @@ def scaffold_suite_item(
         force,
         str(settings.get("previous_ref") or "") or None,
         str(settings.get("current_ref") or "") or None,
-        int(settings.get("parallel_jobs") or 8),
+        int(settings.get("parallel_jobs") or 4),
     )
     corpus_root = ROOT / "corpus" / "imports"
     add_blind_suite_isolation_to_prompts(
@@ -721,7 +721,7 @@ def command_run_blind_suite(args: argparse.Namespace) -> int:
             design_copy,
             audit_run,
             target=target,
-            parallel_jobs=int(settings.get("parallel_jobs") or 8),
+            parallel_jobs=int(settings.get("parallel_jobs") or 4),
             resume=args.resume and item_manifest_path.is_file(),
             phase=args.phase,
             settings=settings,
@@ -791,7 +791,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--suite-name", help="Stable folder name under runs/.")
     parser.add_argument("--previous-ref")
     parser.add_argument("--current-ref")
-    parser.add_argument("--parallel-jobs", type=int, default=8)
+    parser.add_argument("--parallel-jobs", type=int, default=4)
     parser.add_argument("--model")
     parser.add_argument("--agent", choices=AGENT_CHOICES, default=DEFAULT_AGENT)
     parser.add_argument("--service-tier", choices=SERVICE_TIER_CHOICES, default=DEFAULT_SERVICE_TIER)

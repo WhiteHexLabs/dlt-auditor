@@ -88,7 +88,7 @@ Use exactly the design packs named by the user. Validate that each named pack ex
 Scaffold a single design run:
 
 ```bash
-bin/run-design <design-name> /path/to/target-repo --run-name <run-name> --parallel-jobs 8
+bin/run-design <design-name> /path/to/target-repo --run-name <run-name> --parallel-jobs 4
 ```
 
 Then execute the generated design run with that design's runner.
@@ -96,13 +96,13 @@ Then execute the generated design run with that design's runner.
 Codex:
 
 ```bash
-designs/<design-name>/bin/run-parallel-codex designs/<design-name>/runs/<run-name> --jobs 8 --agent codex --service-tier standard --reasoning-effort high --deep-reasoning-effort xhigh --deep-phases canonicalize,validations,aggregate,final
+designs/<design-name>/bin/run-parallel-codex designs/<design-name>/runs/<run-name> --jobs 4 --agent codex --service-tier standard --reasoning-effort high --deep-reasoning-effort xhigh --deep-phases canonicalize,validations,aggregate,final
 ```
 
 Claude Code:
 
 ```bash
-designs/<design-name>/bin/run-parallel-codex designs/<design-name>/runs/<run-name> --jobs 8 --agent claude
+designs/<design-name>/bin/run-parallel-codex designs/<design-name>/runs/<run-name> --jobs 4 --agent claude
 ```
 
 If worker limits are exhausted, preserve the run and resume with `--resume` if supported by the runner.
@@ -120,13 +120,13 @@ bin/run-blind-suite --list-designs
 Start a Codex blind suite:
 
 ```bash
-bin/run-blind-suite --repo /path/to/target-repo --suite-name <suite-name> --design <design-name> --parallel-jobs 8 --agent codex --service-tier standard --reasoning-effort high --deep-reasoning-effort xhigh --deep-phases canonicalize,validations,aggregate,final
+bin/run-blind-suite --repo /path/to/target-repo --suite-name <suite-name> --design <design-name> --parallel-jobs 4 --agent codex --service-tier standard --reasoning-effort high --deep-reasoning-effort xhigh --deep-phases canonicalize,validations,aggregate,final
 ```
 
 Start a Claude Code blind suite:
 
 ```bash
-bin/run-blind-suite --repo /path/to/target-repo --suite-name <suite-name> --design <design-name> --parallel-jobs 8 --agent claude
+bin/run-blind-suite --repo /path/to/target-repo --suite-name <suite-name> --design <design-name> --parallel-jobs 4 --agent claude
 ```
 
 Repeat `--design <design-name>` for multiple designs if requested.

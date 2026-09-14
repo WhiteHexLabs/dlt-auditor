@@ -7,7 +7,7 @@ Use it to run stable audit designs from `designs/` against target codebases. Do 
 For one design, scaffold with:
 
 ```text
-bin/run-design <design-name> /path/to/target-repo --run-name <run-name> --parallel-jobs 8
+bin/run-design <design-name> /path/to/target-repo --run-name <run-name> --parallel-jobs 4
 ```
 
 Then execute the generated design run with that design's `bin/run-parallel-codex`. Use `--agent claude` when the user asks for Claude Code instead of Codex.
@@ -15,7 +15,7 @@ Then execute the generated design run with that design's `bin/run-parallel-codex
 For multiple designs, use:
 
 ```text
-bin/run-blind-suite --repo /path/to/target-repo --suite-name <suite-name> --design <design-name> --parallel-jobs 8
+bin/run-blind-suite --repo /path/to/target-repo --suite-name <suite-name> --design <design-name> --parallel-jobs 4
 ```
 
 Blind suite outputs live under `runs/<suite-name>/`. If worker limits are exhausted, preserve the suite and resume it with:
