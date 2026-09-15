@@ -1,6 +1,6 @@
 ---
 name: dlt-auditor
-description: Run DLT Auditor stable audit designs and blind audit suites against target codebases from this repository. Use when the user asks to run, scaffold, resume, configure, or explain dlt-auditor audit execution, including max, optimal, or custom prompt-pack tiers, Codex and Claude Code agent modes, blind-suite integrity rules, worker-limit recovery, design selection, or the runtime-focused dlt-auditor workflow.
+description: Run DLT Auditor stable audit designs and blind audit suites against target codebases from this repository. Use when the user asks to run, scaffold, resume, configure, or explain dlt-auditor audit execution, including host-native subagent mode, max, optimal, or custom prompt-pack tiers, Codex and Claude Code CLI execution backends, blind-suite integrity rules, worker-limit recovery, design selection, or the runtime-focused dlt-auditor workflow.
 ---
 
 # DLT Auditor
@@ -9,35 +9,43 @@ Use this repository as the runtime for stable audit designs from `designs/` agai
 
 Do not add or reintroduce learning-loop features, benchmark ground truth, candidate scoring, scorecards, miss analysis, leaderboards, promotion workflows, or refinement systems unless the user explicitly asks to rebuild that separate system.
 
+## Execution Modes
+
+When invoked as a Skill inside an agent host (zCode or another):
+
+- Prefer host-native execution: the host agent's own subagents run every audit prompt.
+- Never start the local Codex or Claude CLI unless the user explicitly asks for a CLI execution backend.
+- Never launch `zcode` from the shell to simulate subagents. Subagents are dispatched by the host agent itself.
+- Inherit the host-selected model. Do not pin or override models for subagents.
+- Default maximum concurrency is 3 subagents.
+
+If the host has no subagent capability, degrade to sequential single-agent execution of the same prompts. Never silently fall back to local Codex/Claude CLI workers.
+
+Direct CLI use (`bin/run-blind-suite` without a host agent) defaults to `--execution-backend codex`; pass `--execution-backend claude` for Claude Code, or `--execution-backend host` to scaffold a host-driven suite.
+
+## Workspace
+
+All audit output lives inside the target repository:
+
+```text
+<target-repo>/.dlt-auditor-work/<suite-name>/
+```
+
+Never scatter audit artifacts (`candidate-*.md`, `family-scan-*.md`, `FINAL_AUDIT_REPORT.md`, `repo-context.md`, `agent-logs/`) in the target repo root. By default dlt-auditor does not modify the target's `.gitignore`; it prints a hint instead. Only pass `--update-gitignore` if the user opts in.
+
+Legacy suites under `dlt-auditor/runs/` still resume in place with a warning; never migrate or delete them automatically.
+
 ## Blind Integrity
 
 During blind audit execution, keep audit workers separated from answer-key material.
 
-Do not read known findings, benchmark ground truth, scorecards, miss analyses, result records, leaderboards, refinement plans, audit-output snapshots, candidate result archives, prior round folders, sibling suite outputs, or stable `designs/*/runs/**` output.
+Do not read known findings, benchmark ground truth, scorecards, miss analyses, result records, leaderboards, refinement plans, audit-output snapshots, candidate result archives, prior round folders, sibling suite outputs (including other suites under `.dlt-auditor-work/`), or stable `designs/*/runs/**` output.
 
 Preserve generated suites when worker limits or external interruptions occur. Resume instead of recreating unless the user explicitly asks to replace the suite.
-
-## Agent Choice
-
-Use Codex by default:
-
-```text
---agent codex --service-tier standard --reasoning-effort high --deep-reasoning-effort xhigh --deep-phases canonicalize,validations,aggregate,final
-```
-
-Use Claude Code when the user asks for Claude, Claude Code, or `--agent claude`:
-
-```text
---agent claude
-```
-
-For Claude Code, do not pass Codex reasoning or service-tier overrides. Use `--claude-path` or `--claude-add-dir` only when the user supplies those needs or local execution requires them.
 
 ## Tiers
 
 Treat "prompt packs" and "design packs" as the stable design folders under `designs/`.
-
-Support these tier invocations:
 
 ```text
 $dlt-auditor max ...
@@ -49,92 +57,99 @@ If the target repository or suite name is missing, infer a reasonable suite name
 
 ### Max
 
-Use every runnable design pack under `designs/`.
-
-Discover packs with:
-
-```bash
-bin/run-blind-suite --list-designs
-```
-
-or, if needed:
-
-```bash
-find designs -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
-```
-
-Then run one blind suite with every discovered pack by repeating `--design <design-name>`.
+Use every runnable design pack: `bin/run-blind-suite --list-designs`, then one blind suite repeating `--design <name>` per pack. Designs run sequentially, never in parallel with each other.
 
 ### Optimal
 
-Analyze the target project and available design packs, choose only the packs that best fit the project, and run them. Select at most 5 packs.
-
-Use this selection process:
-
-1. Inspect target repo metadata such as `README*`, package manifests, lockfiles, language/framework files, top-level directories, and dependency names.
-2. Inspect design pack names and high-level pack files such as `designs/<name>/00_protocol_mapper.md`, `01_base_hunter.md`, `02_validation_and_impact.md`, and `05_corpus_pattern_search.md`.
-3. Do not inspect generated runs or answer-key material while selecting.
-4. Prefer packs whose protocol, ecosystem, implementation language, or audit venue matches the target.
-5. If fewer than 5 packs clearly fit, run only the clear fits. If none clearly fit, choose the closest generally applicable packs and state that the selection is a best-effort match.
-
-After choosing, immediately run one blind suite with the selected packs by repeating `--design <design-name>`.
+Select at most 5 packs by matching the target against each pack's `designs/<name>/design-profile.md` (ecosystem, languages, protocol type, execution/consensus model, VM) plus target repo metadata (README, package manifests, lockfiles, dependency names). Do not rely on directory-name guessing as the primary signal. If fewer than 5 packs clearly fit, run only the clear fits and say so.
 
 ### Custom
 
-Use exactly the design packs named by the user. Validate that each named pack exists under `designs/`; if a name is misspelled, list the available packs and ask for correction.
+Use exactly the design packs the user names. Validate each exists under `designs/`; if misspelled, list available packs and ask for correction.
 
-## One Design
+## Host-Native Execution Loop
+
+Phase 1 — scaffold (never starts local Codex/Claude):
+
+```bash
+bin/run-blind-suite \
+  --repo /path/to/target-repo \
+  --suite-name <suite> \
+  --design <design-name> \
+  --execution-backend host
+```
+
+This creates `<target>/.dlt-auditor-work/<suite>/`, copies each design into `design-workspaces/`, scaffolds audit runs under `design-runs/`, and initializes `state/work-queue.json`.
+
+Phase 2 — drive the queue with your own subagents:
+
+```bash
+bin/host-runner <suite-dir> status
+bin/host-runner <suite-dir> next --limit 3
+```
+
+Fixed phase order: `mapper`, `corpus`, `scans`, `canonicalize`, `validations`, `aggregate`, `final`. `mapper`/`corpus`/`canonicalize`/`aggregate`/`final` are serial (one task at a time); `scans` and `validations` are parallel.
+
+For every task returned by `next`:
+
+1. Launch one subagent with the task's `prompt` file content as its instructions. The subagent inherits the host model — never pass a model override.
+2. The subagent may read the target repo, the active design copy, the active audit run directory, and explicit corpus inputs. It must write only the task's listed `outputs`.
+3. Parallel workers own exclusive files: a scan worker edits only its `family-scan-<id>.md`; a validation worker edits only its `candidate-<id>.md`. Shared files (`candidate-index.md`, `rejected-candidates.md`, `FINAL_AUDIT_REPORT.md`, `feature-coverage.md`) are refreshed only by later serial phases.
+4. When a subagent finishes, report immediately:
+
+```bash
+bin/host-runner <suite-dir> complete <task-id>
+bin/host-runner <suite-dir> fail <task-id> --reason "..."
+```
+
+5. Then call `next` again right away — sliding window: refill the slot the moment one worker finishes; never wait for the whole batch. Keep at most 3 subagents active (or the user's override).
+
+When a phase has no pending/running tasks, verify and advance:
+
+```bash
+bin/host-runner <suite-dir> advance
+```
+
+`advance` fails loudly if expected outputs are missing or still template-only; fix or explicitly `fail` the task with a reason first. After the final phase of a design, `advance` scaffolds the next design item automatically; designs never run in parallel.
+
+If host worker limits are exhausted: `bin/host-runner <suite-dir> limit-exhausted <task-id>`, stop, and tell the user to resume later.
+
+## Resume and Recovery
+
+After an interruption (either CLI or Skill):
+
+```bash
+bin/run-blind-suite --repo /path/to/target-repo --suite-name <suite> --resume
+```
+
+Resume re-reads `suite-manifest.json` and per-task state under each run's `agent-logs/runner-state/`, skips completed tasks, requeues pending/failed tasks, and resets stale `running` tasks to `pending`. For host suites, resume with `--execution-backend host` and continue the host loop; the queue skips everything already completed.
+
+## One Design (CLI mode)
 
 Scaffold a single design run:
 
 ```bash
-bin/run-design <design-name> /path/to/target-repo --run-name <run-name> --parallel-jobs 4
+bin/run-design <design-name> /path/to/target-repo --run-name <run-name> --parallel-jobs 3
 ```
 
-Then execute the generated design run with that design's runner.
-
-Codex:
+The run lands under `<target-repo>/.dlt-auditor-work/runs/<run-name>/`. Execute it with the design's runner:
 
 ```bash
-designs/<design-name>/bin/run-parallel-codex designs/<design-name>/runs/<run-name> --jobs 4 --agent codex --service-tier standard --reasoning-effort high --deep-reasoning-effort xhigh --deep-phases canonicalize,validations,aggregate,final
+designs/<design-name>/bin/run-parallel-workers designs/<design-name>/runs/<run-name> --jobs 3 --agent codex --service-tier standard --reasoning-effort high --deep-reasoning-effort xhigh --deep-phases canonicalize,validations,aggregate,final
 ```
 
-Claude Code:
+`run-parallel-codex` remains as a deprecated wrapper of `run-parallel-workers`. If worker limits are exhausted, preserve the run and resume with `--resume`.
+
+## Blind Suites (CLI mode)
 
 ```bash
-designs/<design-name>/bin/run-parallel-codex designs/<design-name>/runs/<run-name> --jobs 4 --agent claude
+bin/run-blind-suite --repo /path/to/target-repo --suite-name <suite> --design <design-name> --parallel-jobs 3 --execution-backend codex --service-tier standard --reasoning-effort high --deep-reasoning-effort xhigh --deep-phases canonicalize,validations,aggregate,final
 ```
 
-If worker limits are exhausted, preserve the run and resume with `--resume` if supported by the runner.
-
-## Blind Suites
-
-Prefer blind suites when running one or more designs as a benchmark-style audit. Outputs live under `runs/<suite-name>/`.
-
-List available designs when the user has not specified one:
+Claude Code workers:
 
 ```bash
-bin/run-blind-suite --list-designs
+bin/run-blind-suite --repo /path/to/target-repo --suite-name <suite> --design <design-name> --parallel-jobs 3 --execution-backend claude
 ```
 
-Start a Codex blind suite:
-
-```bash
-bin/run-blind-suite --repo /path/to/target-repo --suite-name <suite-name> --design <design-name> --parallel-jobs 4 --agent codex --service-tier standard --reasoning-effort high --deep-reasoning-effort xhigh --deep-phases canonicalize,validations,aggregate,final
-```
-
-Start a Claude Code blind suite:
-
-```bash
-bin/run-blind-suite --repo /path/to/target-repo --suite-name <suite-name> --design <design-name> --parallel-jobs 4 --agent claude
-```
-
-Repeat `--design <design-name>` for multiple designs if requested.
-
-Resume an interrupted or worker-limited suite:
-
-```bash
-bin/run-blind-suite --suite-name <suite-name> --resume
-```
-
-Use `--scaffold-only` when the user asks to prepare isolated runs without launching workers. Use `--force` only when the user explicitly wants to replace an existing suite or run.
+For Claude Code, do not pass Codex reasoning or service-tier overrides. `--agent codex|claude` still works but is deprecated in favor of `--execution-backend`. Use `--scaffold-only` to prepare isolated runs without launching workers, and `--force` only when the user explicitly wants to replace an existing suite or run.

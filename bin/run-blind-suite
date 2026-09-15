@@ -1,261 +1,157 @@
 #!/usr/bin/env python3
-"""Run one or more stable audit designs against a target repository."""
+"""Run one or more stable audit designs against a target repository.
+
+Execution backends (plan sections 1-2):
+
+- ``--execution-backend host``   scaffold + host-native queue; the calling
+  agent's own subagents execute prompts (never local Codex/Claude CLIs).
+- ``--execution-backend codex``  subprocess Codex CLI workers (CLI default).
+- ``--execution-backend claude`` subprocess Claude Code workers.
+
+Suites live under ``<target-repo>/.dlt-auditor-work/<suite-name>/`` by
+default; legacy suites under ``<repo>/runs/`` resume in place.
+"""
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
-import json
-import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
-DESIGNS_DIR = ROOT / "designs"
-RUNS_DIR = ROOT / "runs"
-LIMIT_EXHAUSTED_EXIT_CODE = 3
-AGENT_CHOICES = ("codex", "claude")
-DEFAULT_AGENT = "codex"
-SERVICE_TIER_CHOICES = ("standard", "fast", "flex")
-DEFAULT_SERVICE_TIER = "standard"
-REASONING_EFFORT_CHOICES = ("low", "medium", "high", "xhigh")
-DEFAULT_REASONING_EFFORT = "high"
-DEFAULT_DEEP_REASONING_EFFORT = "xhigh"
-DEFAULT_DEEP_PHASES = "canonicalize,validations,aggregate,final"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from runtime.backends import (  # noqa: E402
+    BACKENDS,
+    BackendError,
+    DEFAULT_DEEP_PHASES,
+    DEFAULT_DEEP_REASONING_EFFORT,
+    DEFAULT_PARALLEL_JOBS,
+    DEFAULT_REASONING_EFFORT,
+    DEFAULT_SERVICE_TIER,
+    REASONING_EFFORT_CHOICES,
+    SERVICE_TIER_CHOICES,
+    build_runner_command,
+    resolve_backend,
+    worker_script,
+)
+from runtime.hostqueue import command_status  # noqa: E402
+from runtime.suite import (  # noqa: E402
+    LIMIT_EXHAUSTED_EXIT_CODE,
+    LEGACY_RUNS_DIR,
+    read_json,
+    scaffold_suite,
+    suite_item_dir,
+    update_json,
+    write_suite_manifest,
+    write_suite_readme,
+)
+from runtime.workspace import (  # noqa: E402
+    default_work_root,
+    ensure_suite_layout,
+    print_gitignore_hint,
+    resolve_suite_dir,
+    update_gitignore,
+    utc_now,
+)
+
 RUNNER_PHASE_CHOICES = ("all", "mapper", "corpus", "scans", "canonicalize", "validations", "aggregate", "final")
 
 
-@dataclass(frozen=True)
-class DesignSource:
-    name: str
-    root: Path
-
-    @property
-    def command(self) -> Path:
-        return self.root / "bin" / "dlt-ai-audit-system"
-
-    @property
-    def runner(self) -> Path:
-        return self.root / "bin" / "run-parallel-codex"
-
-
-def utc_now() -> str:
-    return dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def slugify(value: str) -> str:
-    chars = []
-    for ch in value.lower().strip():
-        chars.append(ch if ch.isalnum() else "-")
-    slug = "".join(chars)
-    while "--" in slug:
-        slug = slug.replace("--", "-")
-    return slug.strip("-") or "run"
+def suite_settings_from_args(args: argparse.Namespace, backend: str) -> dict:
+    return {
+        "execution_backend": backend,
+        "parallel_jobs": args.parallel_jobs,
+        "model": args.model or "",
+        "service_tier": args.service_tier,
+        "reasoning_effort": args.reasoning_effort,
+        "deep_reasoning_effort": args.deep_reasoning_effort,
+        "deep_phases": args.deep_phases,
+        "codex_path": args.codex_path or "",
+        "claude_path": args.claude_path or "",
+        "claude_add_dirs": [str(Path(path).expanduser().resolve()) for path in (args.claude_add_dir or [])],
+        "timeout_seconds": args.timeout_seconds,
+        "skip_login_check": args.skip_login_check,
+        "previous_ref": args.previous_ref or "",
+        "current_ref": args.current_ref or "",
+    }
 
 
-def read_json(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
+def load_suite_args(args: argparse.Namespace, backend: str) -> tuple[str, Path, list[str], dict, Path, bool]:
+    if args.resume and not args.suite_name:
+        raise SystemExit("--suite-name is required with --resume")
+    if args.resume and args.force:
+        raise SystemExit("--resume and --force cannot be used together")
 
+    suite_slug = args.suite_name.strip() if args.suite_name else ""
+    work_root_arg = Path(args.work_root).expanduser().resolve() if args.work_root else None
 
-def write_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    resolution = None
+    if suite_slug:
+        # Target repo order: --repo, then the new work root's manifest, then legacy.
+        target_value = args.repo
+        if not target_value and work_root_arg:
+            manifest = read_json(work_root_arg / suite_slug / "suite-manifest.json")
+            target_value = manifest.get("target_repo")
+        if not target_value:
+            legacy_manifest = read_json(LEGACY_RUNS_DIR / suite_slug / "suite-manifest.json")
+            target_value = legacy_manifest.get("target_repo")
+        if not target_value and not args.resume:
+            raise SystemExit("--repo is required for a new blind suite")
+        if not target_value:
+            raise SystemExit(f"Cannot locate suite `{suite_slug}`; pass --repo or --work-root")
+        target = Path(str(target_value)).expanduser().resolve()
+        if not target.is_dir():
+            raise SystemExit(f"Target repo does not exist: {target}")
+        resolution = resolve_suite_dir(
+            repo=target,
+            suite_name=suite_slug,
+            work_root=work_root_arg or default_work_root(target),
+            legacy_runs_dir=LEGACY_RUNS_DIR,
+        )
+        if args.resume and not resolution.suite_dir.is_dir():
+            raise SystemExit(f"Blind suite not found: {resolution.suite_dir}")
+        if resolution.legacy:
+            print(f"warning: {resolution.message}", file=sys.stderr)
+    else:
+        if not args.repo:
+            raise SystemExit("--repo is required for a new blind suite")
+        target = Path(args.repo).expanduser().resolve()
+        if not target.is_dir():
+            raise SystemExit(f"Target repo does not exist: {target}")
+        suite_slug = f"{dt.datetime.now(dt.UTC):%Y%m%d-%H%M%SZ}-{target.name}-blind-suite"
+        resolution = resolve_suite_dir(
+            repo=target,
+            suite_name=suite_slug,
+            work_root=work_root_arg,
+            legacy_runs_dir=LEGACY_RUNS_DIR,
+        )
 
+    suite_dir = resolution.suite_dir
+    manifest_file = suite_dir / "suite-manifest.json"
+    previous_manifest = read_json(manifest_file) if manifest_file.is_file() else {}
 
-def update_json(path: Path, **updates: object) -> dict:
-    payload = read_json(path) if path.is_file() else {}
-    payload.update(updates)
-    payload["updated_at_utc"] = utc_now()
-    write_json(path, payload)
-    return payload
+    designs = [design.strip() for design in (args.design or previous_manifest.get("designs") or []) if design.strip()]
+    designs = ["".join(ch if ch.isalnum() or ch == "-" else "-" for ch in d.lower()) or "run" for d in designs]
+    if not designs:
+        raise SystemExit("--design is required for a new blind suite; repeat it once per design")
+    if len(set(designs)) != len(designs):
+        raise SystemExit("Blind suite design names must be unique")
+    if args.resume and args.design and designs != previous_manifest.get("designs"):
+        raise SystemExit("Resume must use the design list recorded in the existing suite manifest")
 
-
-def design_ignore(_dir: str, names: list[str]) -> set[str]:
-    return {name for name in names if name in {"runs", "__pycache__"} or name.endswith(".pyc")}
-
-
-def copy_design_tree(source: Path, destination: Path, force: bool) -> None:
-    source = source.resolve()
-    destination = destination.resolve()
-    if source == destination:
-        raise SystemExit(f"Source and destination are the same design folder: {source}")
-    if destination.exists():
-        if not force:
-            raise SystemExit(f"Destination already exists: {destination}")
-        shutil.rmtree(destination)
-    shutil.copytree(source, destination, ignore=design_ignore)
-
-
-def command_supports_flag(command: Path, flag: str) -> bool:
-    try:
-        return flag in command.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return False
-
-
-def load_design_source(design: str) -> DesignSource:
-    name = slugify(design)
-    root = DESIGNS_DIR / name
-    if not root.is_dir():
-        raise SystemExit(f"Design not found: {root}")
-    source = DesignSource(name=name, root=root.resolve())
-    if not source.command.is_file():
-        raise SystemExit(f"Design command not found: {source.command}")
-    return source
-
-
-def load_suite_design_source(design_root: Path, design: str) -> DesignSource:
-    source = DesignSource(name=slugify(design), root=design_root.resolve())
-    if not source.command.is_file():
-        raise SystemExit(f"Suite design command not found: {source.command}")
-    return source
-
-
-def resumable_runner_for_source(source_root: Path) -> Path:
-    local_runner = source_root / "bin" / "run-parallel-codex"
-    if (
-        local_runner.is_file()
-        and command_supports_flag(local_runner, "--resume")
-        and command_supports_flag(local_runner, "--reasoning-effort")
-        and command_supports_flag(local_runner, "--service-tier")
-    ):
-        return local_runner
-    return local_runner
-
-
-def scaffold_audit_run(
-    source: DesignSource,
-    repo: Path,
-    run_name: str,
-    force: bool,
-    previous_ref: str | None,
-    current_ref: str | None,
-    parallel_jobs: int,
-) -> Path:
-    args = [str(source.command), str(repo), "--run-name", run_name]
-    if force:
-        args.append("--force")
-    if previous_ref and command_supports_flag(source.command, "--previous-ref"):
-        args.extend(["--previous-ref", previous_ref])
-    if current_ref and command_supports_flag(source.command, "--current-ref"):
-        args.extend(["--current-ref", current_ref])
-    if command_supports_flag(source.command, "--corpus-root"):
-        args.extend(["--corpus-root", str(ROOT / "corpus" / "imports")])
-    if command_supports_flag(source.command, "--parallel-jobs"):
-        args.extend(["--parallel-jobs", str(parallel_jobs)])
-
-    completed = subprocess.run(args, text=True, capture_output=True, check=False)
-    if completed.returncode != 0:
-        print(completed.stdout, end="")
-        print(completed.stderr, end="", file=sys.stderr)
-        raise SystemExit(completed.returncode)
-
-    design_run = source.root / "runs" / run_name
-    if not design_run.is_dir():
-        raise SystemExit(f"Expected design run was not created: {design_run}")
-    return design_run
-
-
-def suite_item_dir(suite_dir: Path, index: int, design_name: str) -> Path:
-    return suite_dir / "design-runs" / f"{index:02d}-{slugify(design_name)}"
-
-
-def suite_design_copy_dir(suite_dir: Path, design_name: str) -> Path:
-    return suite_dir / "design-workspaces" / slugify(design_name) / "design"
-
-
-def audit_option_string(
-    *,
-    agent: str,
-    model: str | None,
-    timeout_seconds: int | None,
-    skip_login_check: bool,
-    service_tier: str,
-    reasoning_effort: str,
-    deep_reasoning_effort: str,
-    deep_phases: str,
-    codex_path: str | None,
-    claude_path: str | None,
-    claude_add_dirs: list[str],
-) -> str:
-    parts: list[str] = []
-    parts.extend(["--agent", agent])
-    if model:
-        parts.extend(["--model", model])
-    if agent == "codex":
-        parts.extend(["--service-tier", service_tier])
-        parts.extend(["--reasoning-effort", reasoning_effort])
-        parts.extend(["--deep-reasoning-effort", deep_reasoning_effort])
-        parts.extend(["--deep-phases", deep_phases])
-        if codex_path:
-            parts.extend(["--codex-path", codex_path])
-    if agent == "claude":
-        if claude_path:
-            parts.extend(["--claude-path", claude_path])
-        for add_dir in claude_add_dirs:
-            parts.extend(["--claude-add-dir", add_dir])
-    if timeout_seconds is not None:
-        parts.extend(["--timeout-seconds", str(timeout_seconds)])
-    if skip_login_check:
-        parts.append("--skip-login-check")
-    return "".join(f" {part}" for part in parts)
-
-
-def write_resume_instructions(
-    item_dir: Path,
-    suite_dir: Path,
-    audit_run: Path,
-    runner: Path,
-    parallel_jobs: int,
-    settings: dict,
-) -> None:
-    agent = str(settings.get("agent") or DEFAULT_AGENT)
-    option_text = audit_option_string(
-        agent=agent,
-        model=str(settings.get("model") or "") or None,
-        timeout_seconds=settings.get("timeout_seconds"),
-        skip_login_check=bool(settings.get("skip_login_check")),
-        service_tier=str(settings.get("service_tier") or DEFAULT_SERVICE_TIER),
-        reasoning_effort=str(settings.get("reasoning_effort") or DEFAULT_REASONING_EFFORT),
-        deep_reasoning_effort=str(settings.get("deep_reasoning_effort") or DEFAULT_DEEP_REASONING_EFFORT),
-        deep_phases=str(settings.get("deep_phases") or DEFAULT_DEEP_PHASES),
-        codex_path=str(settings.get("codex_path") or "") or None,
-        claude_path=str(settings.get("claude_path") or "") or None,
-        claude_add_dirs=[str(path) for path in settings.get("claude_add_dirs", [])],
-    )
-    (item_dir / "RESUME.md").write_text(
-        f"""# Resume Interrupted Audit
-
-The audit run paused before completion, most likely because worker quota or rate limits were exhausted.
-
-Completed worker prompts are checkpointed under:
-
-```text
-{audit_run / "agent-logs" / "runner-state"}
-```
-
-Resume the suite without recreating completed design items:
-
-```bash
-bin/run-blind-suite --suite-name {suite_dir.name} --resume
-```
-
-Lower-level runner command:
-
-```bash
-{runner} {audit_run} --jobs {parallel_jobs} --resume{option_text}
-```
-""",
-        encoding="utf-8",
-    )
+    settings = previous_manifest.get("settings") if args.resume and previous_manifest else None
+    if not isinstance(settings, dict):
+        settings = suite_settings_from_args(args, backend)
+    return suite_slug, target, designs, settings, suite_dir, resolution.legacy
 
 
 def execute_audit_for_item(
     item_dir: Path,
-    source_root: Path,
+    design_copy: Path,
     audit_run: Path,
     *,
     target: Path,
@@ -264,42 +160,39 @@ def execute_audit_for_item(
     phase: str,
     settings: dict,
 ) -> int:
-    runner = resumable_runner_for_source(source_root)
+    runner = worker_script(design_copy)
     if not runner.is_file():
-        print(f"Automatic execution needs a resumable runner: {runner}", file=sys.stderr)
+        print(f"Automatic execution needs a runner: {runner}", file=sys.stderr)
         return 2
 
-    agent = str(settings.get("agent") or DEFAULT_AGENT)
-    command = [str(runner), str(audit_run), "--jobs", str(parallel_jobs), "--phase", phase, "--agent", agent]
-    if resume:
-        command.append("--resume")
-    if settings.get("model"):
-        command.extend(["--model", str(settings["model"])])
-    if agent == "codex":
-        command.extend(["--service-tier", str(settings.get("service_tier") or DEFAULT_SERVICE_TIER)])
-        command.extend(["--reasoning-effort", str(settings.get("reasoning_effort") or DEFAULT_REASONING_EFFORT)])
-        command.extend(
-            ["--deep-reasoning-effort", str(settings.get("deep_reasoning_effort") or DEFAULT_DEEP_REASONING_EFFORT)]
-        )
-        command.extend(["--deep-phases", str(settings.get("deep_phases") or DEFAULT_DEEP_PHASES)])
-        if settings.get("codex_path"):
-            command.extend(["--codex-path", str(settings["codex_path"])])
-    if agent == "claude":
-        if settings.get("claude_path"):
-            command.extend(["--claude-path", str(settings["claude_path"])])
-        claude_dirs = [str(target), str(source_root)]
-        claude_dirs.extend(str(path) for path in settings.get("claude_add_dirs", []))
-        seen_dirs: set[str] = set()
-        for add_dir in claude_dirs:
-            add_path = str(Path(add_dir).expanduser().resolve())
-            if add_path in seen_dirs:
-                continue
-            seen_dirs.add(add_path)
-            command.extend(["--claude-add-dir", add_path])
-    if settings.get("timeout_seconds") is not None:
-        command.extend(["--timeout-seconds", str(settings["timeout_seconds"])])
-    if settings.get("skip_login_check"):
-        command.append("--skip-login-check")
+    backend = str(settings.get("execution_backend") or "codex")
+    claude_dirs = [target, design_copy] if backend == "claude" else []
+    claude_dirs.extend(str(path) for path in settings.get("claude_add_dirs", []))
+    seen: set[str] = set()
+    add_dirs: list[Path] = []
+    for raw in claude_dirs:
+        resolved = str(Path(raw).expanduser().resolve())
+        if resolved not in seen:
+            seen.add(resolved)
+            add_dirs.append(Path(resolved))
+    command = build_runner_command(
+        backend=backend,
+        runner=runner,
+        audit_run=audit_run,
+        parallel_jobs=parallel_jobs,
+        resume=resume,
+        phase=phase,
+        model=str(settings.get("model") or "") or None,
+        service_tier=str(settings.get("service_tier") or DEFAULT_SERVICE_TIER),
+        reasoning_effort=str(settings.get("reasoning_effort") or DEFAULT_REASONING_EFFORT),
+        deep_reasoning_effort=str(settings.get("deep_reasoning_effort") or DEFAULT_DEEP_REASONING_EFFORT),
+        deep_phases=str(settings.get("deep_phases") or DEFAULT_DEEP_PHASES),
+        codex_path=str(settings.get("codex_path") or "") or None,
+        claude_path=str(settings.get("claude_path") or "") or None,
+        claude_add_dirs=add_dirs,
+        timeout_seconds=settings.get("timeout_seconds"),
+        skip_login_check=bool(settings.get("skip_login_check")),
+    )
 
     manifest_path = item_dir / "item-manifest.json"
     update_json(
@@ -328,14 +221,7 @@ def execute_audit_for_item(
             audit_last_returncode=completed.returncode,
             audit_interrupted_at_utc=utc_now(),
         )
-        write_resume_instructions(
-            item_dir,
-            item_dir.parents[1],
-            audit_run,
-            runner,
-            parallel_jobs,
-            settings,
-        )
+        write_resume_instructions(item_dir, audit_run, runner, parallel_jobs, settings)
         print(f"Audit paused because worker limits appear exhausted: {item_dir / 'RESUME.md'}")
         return 0
 
@@ -349,315 +235,88 @@ def execute_audit_for_item(
     return completed.returncode
 
 
-def blind_suite_isolation_addendum(
-    *,
-    suite_dir: Path,
-    original_design_dir: Path,
-    design_root: Path,
-    target: Path,
+def write_resume_instructions(
+    item_dir: Path,
     audit_run: Path,
-    corpus_root: Path,
-) -> str:
-    return f"""# Blind Suite Isolation Addendum
-
-This audit is one item in a blind multi-design suite.
-
-Allowed inputs for this item:
-- Target repository: `{target}`
-- Active copied design directory: `{design_root}`
-- Active audit run directory: `{audit_run}`
-- Shared corpus root: `{corpus_root}`
-
-Forbidden while producing this item's blind audit outputs:
-- Do not read, search, summarize, or use the original stable design directory: `{original_design_dir}`
-- Do not read stable design run output under: `{DESIGNS_DIR / "*" / "runs"}`
-- Do not read any other suite item's copied design, run directory, findings, reports, logs, or agent outputs under: `{suite_dir}`
-- Do not read known findings, answer keys, scorecards, miss analyses, result records, leaderboards, refinement plans, audit-output snapshots, candidate result archives, or prior round folders.
-
-The copied design and active run directory above are allowed. All sibling suite workspaces and previous outputs are forbidden as evidence or examples. If you accidentally see forbidden material, do not use it; record the contamination risk in `verification-log.md` and continue only from target-code evidence.
-
-"""
-
-
-def add_blind_suite_isolation_to_prompts(
-    *,
-    suite_dir: Path,
-    original_design_dir: Path,
-    design_root: Path,
-    target: Path,
-    audit_run: Path,
-    corpus_root: Path,
+    runner: Path,
+    parallel_jobs: int,
+    settings: dict,
 ) -> None:
-    addendum = blind_suite_isolation_addendum(
-        suite_dir=suite_dir,
-        original_design_dir=original_design_dir,
-        design_root=design_root,
-        target=target,
+    backend = str(settings.get("execution_backend") or "codex")
+    command = build_runner_command(
+        backend=backend,
+        runner=runner,
         audit_run=audit_run,
-        corpus_root=corpus_root,
+        parallel_jobs=parallel_jobs,
+        resume=True,
+        phase="all",
+        model=str(settings.get("model") or "") or None,
+        service_tier=str(settings.get("service_tier") or DEFAULT_SERVICE_TIER),
+        reasoning_effort=str(settings.get("reasoning_effort") or DEFAULT_REASONING_EFFORT),
+        deep_reasoning_effort=str(settings.get("deep_reasoning_effort") or DEFAULT_DEEP_REASONING_EFFORT),
+        deep_phases=str(settings.get("deep_phases") or DEFAULT_DEEP_PHASES),
+        codex_path=str(settings.get("codex_path") or "") or None,
+        claude_path=str(settings.get("claude_path") or "") or None,
+        claude_add_dirs=[Path(str(path)) for path in settings.get("claude_add_dirs", [])],
+        timeout_seconds=settings.get("timeout_seconds"),
+        skip_login_check=bool(settings.get("skip_login_check")),
     )
-    prompt_dir = audit_run / "agent-prompts"
-    if not prompt_dir.is_dir():
-        return
-    for prompt_path in sorted(prompt_dir.glob("*.md")):
-        try:
-            existing = prompt_path.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        if "Blind Suite Isolation Addendum" in existing:
-            continue
-        prompt_path.write_text(addendum + existing, encoding="utf-8")
+    (item_dir / "RESUME.md").write_text(
+        f"""# Resume Interrupted Audit
 
+The audit run paused before completion, most likely because worker quota or rate limits were exhausted.
 
-def suite_item_summary(item_dir: Path) -> dict:
-    manifest_path = item_dir / "item-manifest.json"
-    if not manifest_path.is_file():
-        return {"item_dir": str(item_dir), "status": "not_started", "audit_status": "not_started"}
-    manifest = read_json(manifest_path)
-    return {
-        "design": manifest.get("design", ""),
-        "item_dir": str(item_dir),
-        "original_design_dir": manifest.get("original_design_dir", ""),
-        "design_copy_dir": manifest.get("source_design_dir", ""),
-        "audit_run": manifest.get("audit_run", ""),
-        "status": manifest.get("status", ""),
-        "audit_status": manifest.get("audit_status", ""),
-        "resume_command": f"bin/run-blind-suite --suite-name {item_dir.parents[1].name} --resume",
-    }
+Completed worker prompts are checkpointed under:
 
-
-def write_suite_manifest(
-    suite_dir: Path,
-    *,
-    suite_name: str,
-    target: Path,
-    designs: list[str],
-    status: str,
-    settings: dict,
-    created_at_utc: str | None = None,
-    message: str = "",
-) -> dict:
-    manifest_path = suite_dir / "suite-manifest.json"
-    previous = read_json(manifest_path) if manifest_path.is_file() else {}
-    payload = {
-        "schema_version": 1,
-        "kind": "blind-suite",
-        "suite_name": suite_name,
-        "target_repo": str(target),
-        "designs": designs,
-        "status": status,
-        "message": message,
-        "settings": settings,
-        "items": [
-            suite_item_summary(suite_item_dir(suite_dir, index, design))
-            for index, design in enumerate(designs, start=1)
-        ],
-        "created_at_utc": created_at_utc or previous.get("created_at_utc") or utc_now(),
-        "updated_at_utc": utc_now(),
-    }
-    write_json(manifest_path, payload)
-    return payload
-
-
-def write_suite_readme(suite_dir: Path, manifest: dict) -> None:
-    design_lines = "\n".join(f"- `{design}`" for design in manifest.get("designs", [])) or "- none"
-    settings_lines = "\n".join(
-        f"- {key}: `{value}`" for key, value in sorted((manifest.get("settings") or {}).items())
-    )
-    item_lines = [
-        f"- `{item.get('design', '')}`: `{item.get('audit_status', '')}` at `{item.get('item_dir', '')}`"
-        for item in manifest.get("items", [])
-    ]
-    items = "\n".join(item_lines) or "- none"
-    (suite_dir / "README.md").write_text(
-        f"""# Blind Design Suite: {manifest.get("suite_name", suite_dir.name)}
-
-- Target repo: `{manifest.get("target_repo", "")}`
-- Status: `{manifest.get("status", "")}`
-- Updated UTC: {manifest.get("updated_at_utc", "")}
-
-## Designs
-
-{design_lines}
-
-## Settings
-
-{settings_lines}
-
-## Items
-
-{items}
-
-## Resume
-
-```bash
-bin/run-blind-suite --suite-name {suite_dir.name} --resume
+```text
+{audit_run / "agent-logs" / "runner-state"}
 ```
 
-Each design is copied into this suite with old `runs/` output excluded before execution. During an item run, workers may use only the target repository, the copied active design, the active audit run directory, and explicitly named corpus files.
-""",
-        encoding="utf-8",
-    )
-
-
-def suite_settings_from_args(args: argparse.Namespace) -> dict:
-    return {
-        "agent": args.agent,
-        "parallel_jobs": args.parallel_jobs,
-        "model": args.model or "",
-        "service_tier": args.service_tier,
-        "reasoning_effort": args.reasoning_effort,
-        "deep_reasoning_effort": args.deep_reasoning_effort,
-        "deep_phases": args.deep_phases,
-        "codex_path": args.codex_path or "",
-        "claude_path": args.claude_path or "",
-        "claude_add_dirs": [str(Path(path).expanduser().resolve()) for path in (args.claude_add_dir or [])],
-        "timeout_seconds": args.timeout_seconds,
-        "skip_login_check": args.skip_login_check,
-        "previous_ref": args.previous_ref or "",
-        "current_ref": args.current_ref or "",
-    }
-
-
-def load_suite_args(args: argparse.Namespace) -> tuple[str, Path, list[str], dict]:
-    if args.resume and not args.suite_name:
-        raise SystemExit("--suite-name is required with --resume")
-    if args.resume and args.force:
-        raise SystemExit("--resume and --force cannot be used together")
-
-    suite_slug = slugify(args.suite_name) if args.suite_name else ""
-    manifest_path = RUNS_DIR / suite_slug / "suite-manifest.json" if suite_slug else None
-    previous_manifest = read_json(manifest_path) if manifest_path and manifest_path.is_file() else {}
-    if args.resume and not previous_manifest:
-        raise SystemExit(f"Blind suite manifest not found: {manifest_path}")
-
-    target_value = args.repo or previous_manifest.get("target_repo")
-    if not target_value:
-        raise SystemExit("--repo is required for a new blind suite")
-    target = Path(str(target_value)).expanduser().resolve()
-    if not target.is_dir():
-        raise SystemExit(f"Target repo does not exist: {target}")
-
-    designs = [slugify(design) for design in (args.design or previous_manifest.get("designs") or [])]
-    if not designs:
-        raise SystemExit("--design is required for a new blind suite; repeat it once per design")
-    if len(set(designs)) != len(designs):
-        raise SystemExit("Blind suite design names must be unique")
-    if args.resume and args.design and designs != previous_manifest.get("designs"):
-        raise SystemExit("Resume must use the design list recorded in the existing suite manifest")
-
-    if not suite_slug:
-        suite_slug = f"{dt.datetime.now(dt.UTC):%Y%m%d-%H%M%SZ}-{slugify(target.name)}-blind-suite"
-
-    settings = previous_manifest.get("settings") if args.resume and previous_manifest else None
-    if not isinstance(settings, dict):
-        settings = suite_settings_from_args(args)
-    return suite_slug, target, designs, settings
-
-
-def scaffold_suite_item(
-    *,
-    suite_dir: Path,
-    index: int,
-    design_name: str,
-    target: Path,
-    settings: dict,
-    force: bool,
-) -> tuple[Path, Path, Path]:
-    original_source = load_design_source(design_name)
-    item_dir = suite_item_dir(suite_dir, index, design_name)
-    design_copy = suite_design_copy_dir(suite_dir, design_name)
-    if item_dir.exists() and any(item_dir.iterdir()) and not force:
-        raise SystemExit(f"Suite item already exists: {item_dir}")
-    if item_dir.exists() and force:
-        shutil.rmtree(item_dir)
-    if design_copy.exists() and force:
-        shutil.rmtree(design_copy.parent)
-    if not design_copy.is_dir():
-        copy_design_tree(original_source.root, design_copy, False)
-
-    item_dir.mkdir(parents=True, exist_ok=True)
-    suite_source = load_suite_design_source(design_copy, design_name)
-    run_name = f"suite-{suite_dir.name}-{index:02d}-{slugify(design_name)}"
-    audit_run = scaffold_audit_run(
-        suite_source,
-        target,
-        run_name,
-        force,
-        str(settings.get("previous_ref") or "") or None,
-        str(settings.get("current_ref") or "") or None,
-        int(settings.get("parallel_jobs") or 4),
-    )
-    corpus_root = ROOT / "corpus" / "imports"
-    add_blind_suite_isolation_to_prompts(
-        suite_dir=suite_dir,
-        original_design_dir=original_source.root,
-        design_root=design_copy,
-        target=target,
-        audit_run=audit_run,
-        corpus_root=corpus_root,
-    )
-    manifest = {
-        "schema_version": 1,
-        "kind": "blind-suite-item",
-        "suite_name": suite_dir.name,
-        "repo": str(target),
-        "design": design_name,
-        "original_design_dir": str(original_source.root),
-        "source_design_dir": str(design_copy.resolve()),
-        "item_index": index,
-        "item_label": f"{index:02d}-{design_name}",
-        "audit_run": str(audit_run),
-        "audit_status": "not_started",
-        "audit_resume_supported": True,
-        "audit_runner": str(resumable_runner_for_source(design_copy)),
-        "settings": settings,
-        "created_at_utc": utc_now(),
-        "status": "scaffolded",
-    }
-    write_json(item_dir / "item-manifest.json", manifest)
-    (item_dir / "RUN.md").write_text(
-        f"""# Blind Suite Item: {design_name}
-
-- Suite: `{suite_dir}`
-- Target repo: `{target}`
-- Original design: `{original_source.root}`
-- Copied design: `{design_copy.resolve()}`
-- Active audit run: `{audit_run}`
-
-This item is isolated from prior suite results. Do not read sibling suite workspaces or stable `designs/*/runs/**` output while producing findings.
-
-Resume the suite if needed:
+Resume the suite without recreating completed design items:
 
 ```bash
-bin/run-blind-suite --suite-name {suite_dir.name} --resume
+bin/run-blind-suite --suite-name {item_dir.parents[1].name} --resume
+```
+
+Lower-level runner command:
+
+```bash
+{" ".join(command)}
 ```
 """,
         encoding="utf-8",
     )
-    return item_dir, design_copy, audit_run
-
-
-def list_designs() -> int:
-    for path in sorted(DESIGNS_DIR.iterdir()):
-        if (path / "bin" / "dlt-ai-audit-system").is_file():
-            print(path.name)
-    return 0
 
 
 def command_run_blind_suite(args: argparse.Namespace) -> int:
     if args.list_designs:
-        return list_designs()
+        for design in list_designs():
+            print(design)
+        return 0
 
-    suite_slug, target, designs, settings = load_suite_args(args)
-    suite_dir = RUNS_DIR / suite_slug
+    try:
+        backend = resolve_backend(execution_backend=args.execution_backend, agent=args.agent)
+    except BackendError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    suite_slug, target, designs, settings, suite_dir, legacy = load_suite_args(args, backend)
     if suite_dir.exists() and not args.resume:
         if not args.force:
             print(f"Blind suite already exists: {suite_dir}", file=sys.stderr)
             print("Use --resume to continue it or --force to replace it.", file=sys.stderr)
             return 2
+        import shutil
+
         shutil.rmtree(suite_dir)
-    suite_dir.mkdir(parents=True, exist_ok=True)
+    suite_existed = suite_dir.exists()
+    if not legacy:
+        ensure_suite_layout(suite_dir)
+    if not suite_existed:
+        if args.update_gitignore:
+            update_gitignore(target)
+        else:
+            print_gitignore_hint(target)
 
     created_at = None if args.resume else utc_now()
     manifest = write_suite_manifest(
@@ -668,8 +327,34 @@ def command_run_blind_suite(args: argparse.Namespace) -> int:
         status="running",
         settings=settings,
         created_at_utc=created_at,
+        work_root=suite_dir.parent,
+        legacy=legacy,
     )
     write_suite_readme(suite_dir, manifest)
+
+    if backend == "host":
+        scaffold_suite(
+            suite_dir=suite_dir,
+            suite_name=suite_slug,
+            target=target,
+            designs=designs,
+            settings=settings,
+            resume=args.resume,
+            force=args.force,
+            legacy_layout=legacy,
+        )
+        if args.resume:
+            from runtime.hostqueue import load_queue as load_host_queue
+
+            load_host_queue(suite_dir, recover=True)
+        status = command_status(suite_dir)
+        print(f"Host-native suite scaffolded: {suite_dir}")
+        print(f"Execution backend: host (no local Codex/Claude CLI workers will be started)")
+        print(f"Next phase: {status['phase']} ({len(status['pending'])} tasks pending, max concurrency {status['max_concurrency']})")
+        print("Drive execution with:")
+        print(f"  bin/host-runner {suite_dir} next --limit {status['max_concurrency']}")
+        print(f"  bin/host-runner {suite_dir} status")
+        return 0
 
     for index, design_name in enumerate(designs, start=1):
         item_dir = suite_item_dir(suite_dir, index, design_name)
@@ -685,6 +370,8 @@ def command_run_blind_suite(args: argparse.Namespace) -> int:
                     status="running",
                     settings=settings,
                     message=f"Skipped completed design `{design_name}`.",
+                    work_root=suite_dir.parent,
+                    legacy=legacy,
                 )
                 write_suite_readme(suite_dir, manifest)
                 continue
@@ -694,6 +381,8 @@ def command_run_blind_suite(args: argparse.Namespace) -> int:
             audit_run = Path(str(item_manifest.get("audit_run", ""))).expanduser().resolve()
             design_copy = Path(str(item_manifest.get("source_design_dir", ""))).expanduser().resolve()
         else:
+            from runtime.suite import scaffold_suite_item
+
             item_dir, design_copy, audit_run = scaffold_suite_item(
                 suite_dir=suite_dir,
                 index=index,
@@ -701,6 +390,7 @@ def command_run_blind_suite(args: argparse.Namespace) -> int:
                 target=target,
                 settings=settings,
                 force=args.force,
+                legacy_layout=legacy,
             )
 
         if args.scaffold_only:
@@ -712,6 +402,8 @@ def command_run_blind_suite(args: argparse.Namespace) -> int:
                 status="scaffolded",
                 settings=settings,
                 message="Suite scaffolded without execution.",
+                work_root=suite_dir.parent,
+                legacy=legacy,
             )
             write_suite_readme(suite_dir, manifest)
             continue
@@ -721,7 +413,7 @@ def command_run_blind_suite(args: argparse.Namespace) -> int:
             design_copy,
             audit_run,
             target=target,
-            parallel_jobs=int(settings.get("parallel_jobs") or 4),
+            parallel_jobs=int(settings.get("parallel_jobs") or DEFAULT_PARALLEL_JOBS),
             resume=args.resume and item_manifest_path.is_file(),
             phase=args.phase,
             settings=settings,
@@ -736,6 +428,8 @@ def command_run_blind_suite(args: argparse.Namespace) -> int:
                 status="limit_exhausted",
                 settings=settings,
                 message=f"Paused while running `{design_name}`. Resume with --resume.",
+                work_root=suite_dir.parent,
+                legacy=legacy,
             )
             write_suite_readme(suite_dir, manifest)
             print(f"Blind suite paused because worker limits appear exhausted: {suite_dir / 'README.md'}")
@@ -749,6 +443,8 @@ def command_run_blind_suite(args: argparse.Namespace) -> int:
                 status="failed",
                 settings=settings,
                 message=f"Stopped after `{design_name}` failed.",
+                work_root=suite_dir.parent,
+                legacy=legacy,
             )
             write_suite_readme(suite_dir, manifest)
             return result or int(item_manifest.get("audit_last_returncode") or 1)
@@ -761,6 +457,8 @@ def command_run_blind_suite(args: argparse.Namespace) -> int:
             status="running",
             settings=settings,
             message=f"Completed `{design_name}`.",
+            work_root=suite_dir.parent,
+            legacy=legacy,
         )
         write_suite_readme(suite_dir, manifest)
 
@@ -773,10 +471,18 @@ def command_run_blind_suite(args: argparse.Namespace) -> int:
         status=final_status,
         settings=settings,
         message="Blind suite completed." if not args.scaffold_only else "Blind suite scaffolded.",
+        work_root=suite_dir.parent,
+        legacy=legacy,
     )
     write_suite_readme(suite_dir, manifest)
     print(suite_dir)
     return 0
+
+
+def list_designs() -> list[str]:
+    from runtime.suite import list_designs as _list
+
+    return _list()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -788,12 +494,36 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         help="Design folder name under designs/. Repeat once per design.",
     )
-    parser.add_argument("--suite-name", help="Stable folder name under runs/.")
+    parser.add_argument("--suite-name", help="Stable folder name under the target's .dlt-auditor-work/.")
+    parser.add_argument(
+        "--execution-backend",
+        choices=BACKENDS,
+        default=None,
+        help=(
+            "How audit prompts are executed: host = the calling agent's own subagents (never local "
+            "Codex/Claude CLIs); codex = subprocess Codex CLI workers (default for direct CLI use); "
+            "claude = subprocess Claude Code workers."
+        ),
+    )
+    parser.add_argument(
+        "--agent",
+        choices=("codex", "claude"),
+        default=None,
+        help="Deprecated alias for --execution-backend codex|claude.",
+    )
+    parser.add_argument(
+        "--work-root",
+        help="Custom work root for suite output. Defaults to <target-repo>/.dlt-auditor-work/.",
+    )
+    parser.add_argument(
+        "--parallel-jobs",
+        type=int,
+        default=DEFAULT_PARALLEL_JOBS,
+        help=f"Maximum concurrent workers (default: {DEFAULT_PARALLEL_JOBS}).",
+    )
     parser.add_argument("--previous-ref")
     parser.add_argument("--current-ref")
-    parser.add_argument("--parallel-jobs", type=int, default=4)
-    parser.add_argument("--model")
-    parser.add_argument("--agent", choices=AGENT_CHOICES, default=DEFAULT_AGENT)
+    parser.add_argument("--model", help="Explicit worker model. Default: never override the backend's own model choice.")
     parser.add_argument("--service-tier", choices=SERVICE_TIER_CHOICES, default=DEFAULT_SERVICE_TIER)
     parser.add_argument("--codex-path")
     parser.add_argument("--claude-path")
@@ -816,6 +546,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", action="store_true", help="Continue an existing suite and skip completed designs.")
     parser.add_argument("--scaffold-only", action="store_true", help="Create isolated design runs without launching workers.")
     parser.add_argument("--force", action="store_true", help="Replace an existing suite when not using --resume.")
+    parser.add_argument(
+        "--update-gitignore",
+        action="store_true",
+        help=(
+            "Opt-in: append `.dlt-auditor-work/` to the target repo's .gitignore when creating the work root. "
+            "By default dlt-auditor only prints a hint and never modifies the target repo."
+        ),
+    )
     return parser
 
 

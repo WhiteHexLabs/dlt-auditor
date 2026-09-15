@@ -63,7 +63,7 @@ Do not read, search, summarize, or use any answer-key material while producing b
 - No known-findings, answer-key, or benchmark `ground-truth/**` files.
 - No scorecards, miss analyses, result records, leaderboards, refinement plans, audit-output snapshots, candidate result archives, prior round folders, or previous audit outputs.
 - No stable design run output under `designs/*/runs/**`.
-- No sibling blind-suite outputs under `runs/**`.
+- No sibling blind-suite outputs under `runs/**` or under other work roots such as `<target>/.dlt-auditor-work/**`.
 
 Use previous findings or corpus material only when explicitly named as corpus inputs or hypothesis generators, never as evidence for a live finding.
 
@@ -125,6 +125,72 @@ def default_shared_corpus_root(system_root: Path) -> Path:
     return system_root / "corpus" / "imports"
 
 
+def load_design_profile(system_root: Path) -> dict:
+    """Read design-profile.md focus surfaces (hypothesis context only)."""
+    path = system_root / "design-profile.md"
+    profile: dict = {"name": system_root.name, "keys": {}, "focus_surfaces": []}
+    if not path.is_file():
+        return profile
+    section = None
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if line.startswith("## "):
+            title = line[3:].strip().lower()
+            section = "focus_surfaces" if title == "focus surfaces" else None
+            continue
+        if not line.startswith("- "):
+            continue
+        item = line[2:].strip()
+        if section:
+            profile[section].append(item)
+        elif ":" in item:
+            key, _, value = item.partition(":")
+            normalized = key.strip().lower().replace(" ", "_")
+            if len(normalized) <= 40:
+                profile["keys"][normalized] = value.strip()
+    return profile
+
+
+def build_feature_coverage_expectations(profile: dict) -> str:
+    keys = profile.get("keys", {})
+    meta = "; ".join(f"{key}: {value}" for key, value in keys.items()) or "not specified"
+    surfaces = profile.get("focus_surfaces") or []
+    if surfaces:
+        listed = "\n".join(f"- {surface}" for surface in surfaces)
+        surface_text = (
+            "Start with the design-profile focus surfaces below as audit-priority "
+            "hypothesis context, unless repository evidence proves they are irrelevant:\n"
+            f"{listed}"
+        )
+    else:
+        surface_text = (
+            "No design-profile focus surfaces are recorded. Discover the protocol "
+            "surfaces from the repository itself and cover every high-risk surface "
+            "the mapping finds."
+        )
+    return (
+        f"Design profile `{profile.get('name', 'unknown')}` ({meta}).\n\n"
+        f"{surface_text}\n\n"
+        "These focus surfaces are hypothesis context and audit priority only. A surface "
+        "being listed is never evidence: every finding still requires target evidence, "
+        "reachability, attacker control, and impact.\n\n"
+        + "For each feature, record files/functions reviewed, tests searched, changed files, equivalent paths compared, candidate IDs, rejected ideas, and residual risk."
+    )
+
+
+def build_coverage_table_rows(profile: dict) -> str:
+    rows = []
+    for surface in profile.get("focus_surfaces") or []:
+        label = surface.rstrip(".").split(" (")[0].replace("|", "/")
+        if len(label) > 80:
+            label = label[:77] + "..."
+        rows.append(f"| {label} | Not started |  |  |  |  |  |  |  |")
+    rows.append("| RPC, simulation, replay, recovery, and debug paths | Not started |  |  |  |  |  |  |  |")
+    rows.append("| Invariants, accounting, deletion, and refund paths | Not started |  |  |  |  |  |  |  |")
+    rows.append("| Other high-risk surfaces discovered during mapping | Not started |  |  |  |  |  |  |  |")
+    return "\n".join(rows)
+
+
 def write_file(path: Path, content: str, force: bool) -> None:
     if path.exists() and not force:
         return
@@ -133,6 +199,7 @@ def write_file(path: Path, content: str, force: bool) -> None:
 
 def build_autonomous_prompt(
     system_root: Path,
+    profile: dict,
     target: Path,
     run_dir: Path,
     prompt_files: list[Path],
@@ -150,6 +217,7 @@ def build_autonomous_prompt(
         for prompt_file in prompt_files
     )
     diff_instructions = build_diff_instructions(previous_ref, current_ref)
+    feature_expectations = build_feature_coverage_expectations(profile)
     return build_prompt_header("Autonomous Max Audit", target, run_dir) + f"""You are the AI auditor for this run.
 
 Do the entire audit pipeline end to end without waiting for separate prompts unless you hit a real blocker that cannot be resolved from local context.
@@ -207,15 +275,8 @@ This is a max-depth audit. Do not treat speed as success. Treat the run as incom
 
 ## Feature Coverage Expectations
 
-Start with these XRP Ledger April 2026 surfaces unless the repository evidence proves they are irrelevant:
-- Batch transactions and nested execution semantics.
-- Permission delegation, signer scope, and authorization boundary changes.
-- MPT DEX paths, order crossing, transfer-fee handling, and book/accounting interactions.
-- Confidential MPT, proof-bearing artifacts, encrypted balances, and public/private state binding.
-- Sponsored fees, sponsored reserves, fee accounting, reserve accounting, and deletion/refund paths.
-- Amendment gates, migration paths, compatibility paths, RPC exposure, replay/recovery, simulation, and invariants that touch any of the above.
+{feature_expectations}
 
-For each feature, record files/functions reviewed, tests searched, changed files, equivalent paths compared, candidate IDs, rejected ideas, and residual risk.
 
 ## Quality Gates
 
@@ -259,17 +320,17 @@ The safe split is:
 Recommended command:
 
 ```bash
-{system_root / "bin" / "run-parallel-codex"} {run_dir} --jobs {jobs} --service-tier fast --reasoning-effort high --deep-reasoning-effort xhigh
+{system_root / "bin" / "run-parallel-workers"} {run_dir} --jobs {jobs} --service-tier fast --reasoning-effort high --deep-reasoning-effort xhigh
 ```
 
 Useful partial commands:
 
 ```bash
-{system_root / "bin" / "run-parallel-codex"} {run_dir} --phase mapper --service-tier fast --reasoning-effort high
-{system_root / "bin" / "run-parallel-codex"} {run_dir} --phase corpus --service-tier fast --reasoning-effort high
-{system_root / "bin" / "run-parallel-codex"} {run_dir} --phase scans --jobs {jobs} --service-tier fast --reasoning-effort high
-{system_root / "bin" / "run-parallel-codex"} {run_dir} --phase validations --service-tier fast --deep-reasoning-effort xhigh
-{system_root / "bin" / "run-parallel-codex"} {run_dir} --phase final --service-tier fast --deep-reasoning-effort xhigh
+{system_root / "bin" / "run-parallel-workers"} {run_dir} --phase mapper --service-tier fast --reasoning-effort high
+{system_root / "bin" / "run-parallel-workers"} {run_dir} --phase corpus --service-tier fast --reasoning-effort high
+{system_root / "bin" / "run-parallel-workers"} {run_dir} --phase scans --jobs {jobs} --service-tier fast --reasoning-effort high
+{system_root / "bin" / "run-parallel-workers"} {run_dir} --phase validations --service-tier fast --deep-reasoning-effort xhigh
+{system_root / "bin" / "run-parallel-workers"} {run_dir} --phase final --service-tier fast --deep-reasoning-effort xhigh
 ```
 
 Operational rules:
@@ -325,7 +386,8 @@ def build_rejected_candidates(now: dt.datetime, target: Path) -> str:
 """
 
 
-def build_feature_coverage(now: dt.datetime, target: Path, previous_ref: str | None, current_ref: str | None) -> str:
+def build_feature_coverage(now: dt.datetime, target: Path, previous_ref: str | None, current_ref: str | None, profile: dict) -> str:
+    coverage_rows = build_coverage_table_rows(profile)
     return f"""# Feature Coverage
 
 ## Metadata
@@ -340,15 +402,7 @@ def build_feature_coverage(now: dt.datetime, target: Path, previous_ref: str | N
 
 | Feature / Surface | Status | Changed Files | Files And Functions Reviewed | Equivalent Paths Compared | Tests Searched | Candidate IDs | Rejected Ideas | Remaining Risk |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Batch transactions | Not started |  |  |  |  |  |  |  |
-| Permission delegation | Not started |  |  |  |  |  |  |  |
-| MPT DEX | Not started |  |  |  |  |  |  |  |
-| Confidential MPT | Not started |  |  |  |  |  |  |  |
-| Sponsored fees and reserves | Not started |  |  |  |  |  |  |  |
-| Amendment gates and migrations | Not started |  |  |  |  |  |  |  |
-| RPC, simulation, replay, recovery, and debug paths | Not started |  |  |  |  |  |  |  |
-| Invariants, accounting, deletion, and refund paths | Not started |  |  |  |  |  |  |  |
-| Other high-risk surfaces discovered during mapping | Not started |  |  |  |  |  |  |  |
+{coverage_rows}
 
 ## Notes
 
@@ -484,12 +538,21 @@ def main() -> int:
     parser.add_argument(
         "--parallel-jobs",
         type=int,
-        default=int(os.environ.get("DLT_AUDIT_PARALLEL_JOBS", "4")),
-        help="Suggested Codex worker count recorded in generated parallel-run instructions.",
+        default=int(os.environ.get("DLT_AUDIT_PARALLEL_JOBS", "3")),
+        help="Suggested worker count recorded in generated parallel-run instructions.",
+    )
+    parser.add_argument(
+        "--runs-dir",
+        default=os.environ.get("DLT_AUDIT_RUNS_DIR"),
+        help=(
+            "Directory that holds run folders. Defaults to "
+            "<target-repo>/.dlt-auditor-work/runs/ so audit output stays inside the target repository."
+        ),
     )
     args = parser.parse_args()
 
     system_root = Path(__file__).resolve().parents[1]
+    profile = load_design_profile(system_root)
     corpus_root = (
         Path(args.corpus_root).expanduser().resolve()
         if args.corpus_root
@@ -502,7 +565,12 @@ def main() -> int:
 
     prompts_dir = system_root / "prompts"
     templates_dir = system_root / "templates"
-    runs_dir = system_root / "runs"
+    default_runs_root = target / ".dlt-auditor-work" / "runs"
+    runs_dir = (
+        Path(args.runs_dir).expanduser().resolve()
+        if args.runs_dir
+        else default_runs_root
+    )
     prompt_files = sorted(prompts_dir.glob("*.md"))
     if not prompt_files:
         print(f"No prompt families found under {prompts_dir}", file=sys.stderr)
@@ -518,6 +586,10 @@ def main() -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     prompt_out_dir.mkdir(parents=True, exist_ok=True)
     corpus_retrieval_dir.mkdir(parents=True, exist_ok=True)
+    if runs_dir == default_runs_root:
+        gitignore = target / ".gitignore"
+        if gitignore.is_file() and ".dlt-auditor-work" not in gitignore.read_text(encoding="utf-8"):
+            print(f"Hint: consider adding `.dlt-auditor-work/` to {gitignore} so audit output stays untracked.")
 
     branch = run_git(["branch", "--show-current"], target) or "unknown"
     commit = run_git(["rev-parse", "--short", "HEAD"], target) or "unknown"
@@ -569,6 +641,7 @@ Instructions:
         prompt_out_dir / "00-RUN-AUTONOMOUS-MAX-AUDIT.md",
         build_autonomous_prompt(
             system_root,
+            profile,
             target,
             run_dir,
             prompt_files,
@@ -745,7 +818,7 @@ Check for:
     write_file(run_dir / "rejected-candidates.md", build_rejected_candidates(now, target), args.force)
     write_file(
         run_dir / "feature-coverage.md",
-        build_feature_coverage(now, target, args.previous_ref, args.current_ref),
+        build_feature_coverage(now, target, args.previous_ref, args.current_ref, profile),
         args.force,
     )
     write_file(run_dir / "verification-log.md", build_verification_log(now, target), args.force)
